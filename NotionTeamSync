@@ -1,0 +1,303 @@
+/***************************************
+ * NotionTeamSync.gs
+ * Writes team assignments from Sheets -> Notion
+ *
+ * Depends on existing functions in your project:
+ * - getNextSunday_()
+ * - getScheduleSheetForDate_()
+ * - weekNumberSundayStart_()
+ * - readScheduleRowByWeek_()
+ * - getHeaders_()
+ * - buildAssignmentsForRow_()
+ * - getVolunteersById_()
+ * - queryRowsByDate_()
+ * - toIsoDate_()
+ * - notionHeaders_()
+ * - notionPropToString_()
+ * - escapeHtml_()  (optional, used for HTML email)
+ ***************************************/
+
+/**
+ * Entry point called from sendThursdayReminders().
+ * Computes next Sunday and updates matching Notion pages.
+ */
+function syncNotionTeamsForNextSunday() {
+  if (!NOTION || !NOTION.ENABLED) return;
+  if (!CONFIG || !CONFIG.NOTION_TEAM_SYNC_ENABLED) return;
+
+  const nextSunday = getNextSunday_(new Date());
+
+  // Optional: sanity-check the DB schema first (emails you and aborts if missing)
+  validateNotionTeamProps_();
+
+  updateNotionTeamsForDate_(nextSunday);
+}
+
+/**
+ * Ensures the 4 properties exist on the Notion database.
+ * If missing, throws an error (caught by caller try/catch) so you get notified.
+ */
+function validateNotionTeamProps_() {
+  const dbId = (NOTION.DB_ID || '').replace(/-/g, '');
+  if (!dbId) throw new Error('NOTION.DB_ID is empty.');
+
+  const url = `https://api.notion.com/v1/databases/${dbId}`;
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: notionHeaders_(),
+    muteHttpExceptions: true
+  });
+
+  if (resp.getResponseCode() !== 200) {
+    throw new Error('Notion DB fetch failed: ' + resp.getContentText());
+  }
+
+  const db = JSON.parse(resp.getContentText());
+  const props = db.properties || {};
+
+  const required = [
+    NOTION.TEAM_MORNING_MUSIC_PROP,
+    NOTION.TEAM_COUNTING_PROP,
+    NOTION.TEAM_AV_PROP,
+    NOTION.TEAM_EVENING_MUSIC_PROP
+  ];
+
+  const missing = required.filter(name => !props[name]);
+  if (missing.length) {
+    throw new Error(
+      'Notion DB is missing required properties: ' + missing.join(', ') +
+      '. Create them as Rich text in Notion and re-run.'
+    );
+  }
+}
+
+/**
+ * Builds the 4 strings to write to Notion from the schedule for that Sunday.
+ */
+function buildTeamFieldsForDate_(serviceDate) {
+  const scheduleSheet = getScheduleSheetForDate_(serviceDate);
+  const weekNum = weekNumberSundayStart_(serviceDate);
+  const sched = readScheduleRowByWeek_(scheduleSheet, weekNum);
+  if (!sched) return null;
+
+  const headers = getHeaders_(scheduleSheet);
+  const assignments = buildAssignmentsForRow_(sched, headers);
+  const volunteersMap = getVolunteersById_();
+
+  // Counting: Counting1, Counting2, Counting3 (backup)
+  const countingIds = [
+    ...(assignments.roles?.counting || []),
+    String(assignments.backups?.counterId || '').trim()
+  ].filter(Boolean);
+
+  // Morning Music: Music1..Music5
+  const morningMusicIds = (assignments.roles?.music || []).map(x => String(x || '').trim()).filter(Boolean);
+
+  // AV: AV1, AV2, AV3 (backup)
+  const avIds = [
+    ...(assignments.roles?.av || []),
+    String(assignments.backups?.avId || '').trim()
+  ].filter(Boolean);
+
+  // Evening Music: single ID in EveningMusic column (your special)
+  const eveningMusicId = String(assignments.specials?.eveningMusic || '').trim();
+
+  const countingNames = fullNamesFromIds_(volunteersMap, countingIds);
+  const morningMusicNames = fullNamesFromIds_(volunteersMap, morningMusicIds);
+  const avNames = fullNamesFromIds_(volunteersMap, avIds);
+  const eveningMusicName = fullNamesFromIds_(volunteersMap, [eveningMusicId]);
+
+  return {
+    counting: countingNames.join(', '),
+    morningMusic: morningMusicNames.join(', '),
+    av: avNames.join(', '),
+    eveningMusic: eveningMusicName.join(', ') // single name
+  };
+}
+
+/**
+ * Converts IDs -> "First Last" using volunteersMap.
+ */
+function fullNamesFromIds_(volunteersMap, ids) {
+  return (ids || [])
+    .map(id => String(id || '').trim())
+    .filter(Boolean)
+    .map(id => {
+      const v = volunteersMap[id];
+      if (!v) return '';
+      const first = String(v.FirstName || '').trim();
+      const last  = String(v.LastName || '').trim();
+      return [first, last].filter(Boolean).join(' ').trim();
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Notion Rich Text property payload.
+ */
+function notionRichText_(s) {
+  return {
+    rich_text: [{ type: 'text', text: { content: String(s || '') } }]
+  };
+}
+
+/**
+ * Queries Notion pages for that date and updates the 4 team fields.
+ * Sends you an email if an already-populated value was overridden.
+ */
+function updateNotionTeamsForDate_(serviceDate, opts) {
+  opts = opts || {};
+  const collectOverrides = !!opts.collectOverrides;
+
+  if (!NOTION || !NOTION.ENABLED) return collectOverrides ? [] : undefined;
+
+  const iso = toIsoDate_(serviceDate);
+  const pages = queryRowsByDate_(iso);
+  if (!pages || !pages.length) return collectOverrides ? [] : undefined;
+
+  // You said this will never be multiple pages; still safe:
+  const page = pages[0];
+
+  const newFields = buildTeamFieldsForDate_(serviceDate);
+  if (!newFields) return collectOverrides ? [] : undefined;
+
+  const updates = {
+    [NOTION.TEAM_MORNING_MUSIC_PROP]: newFields.morningMusic,
+    [NOTION.TEAM_COUNTING_PROP]:      newFields.counting,
+    [NOTION.TEAM_AV_PROP]:            newFields.av,
+    [NOTION.TEAM_EVENING_MUSIC_PROP]: newFields.eveningMusic
+  };
+
+  const skipEmpty = !!CONFIG.NOTION_TEAM_SYNC_SKIP_EMPTY;
+  const overrideNotices = [];
+
+  const props = page.properties || {};
+  const patchProps = {};
+
+  Object.entries(updates).forEach(([propName, newVal]) => {
+    const next = String(newVal || '').trim();
+    if (skipEmpty && !next) return;
+
+    const prev = String(notionPropToString_(props[propName]) || '').trim();
+    if (prev === next) return; // no change
+
+    patchProps[propName] = notionRichText_(next);
+
+    // Only notify "override" if previously populated
+    if (prev) {
+      overrideNotices.push({
+        dateIso: iso,
+        propName,
+        prev,
+        next,
+        pageId: page.id
+      });
+    }
+  });
+
+  if (Object.keys(patchProps).length) {
+    const url = `https://api.notion.com/v1/pages/${page.id}`;
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'patch',
+      headers: notionHeaders_(),
+      payload: JSON.stringify({ properties: patchProps }),
+      muteHttpExceptions: true
+    });
+
+    const code = resp.getResponseCode();
+    if (code < 200 || code >= 300) {
+      throw new Error('Notion page update failed: ' + resp.getContentText());
+    }
+  }
+
+  // If running in single-date mode, email immediately
+  if (!collectOverrides && overrideNotices.length) {
+    emailOverridesToSelf_(overrideNotices);
+  }
+
+  // In batch mode, return overrides so caller can send one email
+  return collectOverrides ? overrideNotices : undefined;
+}
+
+/**
+ * Emails you when overrides occurred.
+ */
+function emailOverridesToSelf_(items, opts) {
+  opts = opts || {};
+  const subjectSuffix = opts.subjectSuffix || '';
+  const me = Session.getActiveUser().getEmail();
+
+  let body = '';
+  body += 'Notion team fields were overridden:\n\n';
+
+  // Group by date to make it readable
+  const byDate = {};
+  items.forEach(it => {
+    byDate[it.dateIso] = byDate[it.dateIso] || [];
+    byDate[it.dateIso].push(it);
+  });
+
+  Object.keys(byDate).sort().forEach(dateIso => {
+    body += `=== ${dateIso} ===\n`;
+    byDate[dateIso].forEach(it => {
+      body += `Field: ${it.propName}\n`;
+      body += `Previous: ${it.prev}\n`;
+      body += `New: ${it.next}\n`;
+      body += `Page ID: ${it.pageId}\n`;
+      body += '---\n';
+    });
+    body += '\n';
+  });
+
+  GmailApp.sendEmail(me, 'Notion override notice (teams)' + subjectSuffix, body);
+}
+
+/**
+ * Emails you if the sync crashes (so reminders still go out).
+ */
+function notifyTeamSyncFailure_(err) {
+  const me = Session.getActiveUser().getEmail();
+  const msg = (err && err.stack) ? err.stack : String(err || 'Unknown error');
+  GmailApp.sendEmail(me, 'ERROR: Notion team sync failed', msg);
+}
+
+function getNextNSundays_(startFromDate, n) {
+  const sundays = [];
+  let d = getNextSunday_(startFromDate);
+  for (let i = 0; i < n; i++) {
+    sundays.push(new Date(d));
+    d.setDate(d.getDate() + 7);
+  }
+  return sundays;
+}
+
+function syncNotionTeamsNext4Weeks() {
+  if (!NOTION || !NOTION.ENABLED) return;
+  if (!CONFIG || !CONFIG.NOTION_TEAM_SYNC_ENABLED) return;
+
+  // Optional schema check once
+  validateNotionTeamProps_();
+
+  const sundays = getNextNSundays_(new Date(), 4);
+
+  // Collect all overrides across all dates into one email
+  const allOverrides = [];
+
+  sundays.forEach(sunday => {
+    const overridesForDate = updateNotionTeamsForDate_(sunday, { collectOverrides: true });
+    if (overridesForDate && overridesForDate.length) {
+      allOverrides.push(...overridesForDate);
+    }
+  });
+
+  if (allOverrides.length) {
+    emailOverridesToSelf_(allOverrides, { subjectSuffix: ' (next 4 weeks)' });
+  }
+}
+
+function debugPreviewNotionTeams() {
+  const nextSunday = getNextSunday_(new Date());
+  const fields = buildTeamFieldsForDate_(nextSunday);
+  Logger.log('Next Sunday: ' + toIsoDate_(nextSunday));
+  Logger.log(JSON.stringify(fields, null, 2));
+}
