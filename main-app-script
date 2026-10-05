@@ -1,0 +1,1799 @@
+/*******************************
+ * Volunteer Reminder Automations
+ * UPDATE NOTION DB_ID 
+ * Sheets:
+ *  - "volunteers": ID, FirstName, LastName, Email, PhoneNumber, Counting, Music, AV, ServiceCounter
+ *  - "2025": Week, Counting1, Counting2, Counting3, Music1..Music5, AV1..AV3
+ * Assumptions:
+ *  - "Week" = week index (1..52/53) where Week 1 = first Sunday of that year.
+ *  - Schedule cells contain volunteer IDs that match the "volunteers" sheet. 
+ *******************************/
+
+const CONFIG = {
+  VOL_SHEET: 'volunteers',
+  SCHED_SHEET: '2025',         // change to the year tab you are using
+  TIMEZONE: 'America/Los_Angeles',
+  WEEKLY_SEND_HOUR: 9,         // 9am PT Thursday ***********************************************************************
+  FROM_NAME: 'Brian Lee',
+  UPDATE_SERVICE_COUNTER: true, // set false if you don't want counters updated
+  TEST_MODE: false,
+  NOTION_TEAM_SYNC_ENABLED: true,   // set false to disable write-back
+  NOTION_TEAM_SYNC_SKIP_EMPTY: true // don't wipe Notion with blanks
+};
+
+// --- Notion config ---
+const NOTION = {
+  ENABLED: true,
+  API_VERSION: '2022-06-28',
+  DB_ID: '###', // your database id
+  DATE_PROP: 'Date',        // the Notion "date" property name in the DB
+  MAX_CHARS: 10000,           // optional truncate for email
+  PREACHER_NAME_PROP: 'Preacher',
+  GUEST_EMAIL_PROP: "Guest Preachers' Email",
+  EVENING_PREACHER_NAME_PROP: 'Evening Preacher',
+  EVENING_PREACHER_EMAIL_PROP: "Evening Preacher's Email",
+  EVENING_PASSAGE_PROP: 'Evening Passage',
+  TEAM_MORNING_MUSIC_PROP: 'Morning Music',
+  TEAM_COUNTING_PROP: 'Counting',
+  TEAM_AV_PROP: 'Audio/Visual',
+  TEAM_EVENING_MUSIC_PROP: 'Evening Music',
+  SERVICE_LEADER_PROP: 'Service Leader'
+};
+
+// Column groups in the schedule tab
+// NOTE: Counting3 and AV3 are BACKUPS, not primaries.
+const COLS = {
+  COUNTING_PRIMARIES: ['Counting1', 'Counting2'],
+  COUNTING_BACKUP: 'Counting3',
+  MUSIC: ['Music1', 'Music2', 'Music3', 'Music4', 'Music5'],
+  AV_PRIMARIES: ['AV1', 'AV2'],
+  AV_BACKUP: 'AV3',
+  MORNING_LEAD: 'MorningLead',
+  EVENING_LEAD: 'EveningLead',
+  EVENING_MUSIC: 'EveningMusic',
+  EVENING_PREACH: 'EveningPreach',
+  GUEST_PREACH: 'GuestPreach'
+};
+
+
+
+// ========== PUBLIC: one-time trigger setup ==========
+function createTriggers() {
+  deleteAllTriggers_(); // keep using your existing helper
+
+  // One Thursday trigger at your chosen hour (uses CONFIG.WEEKLY_SEND_HOUR)
+  ScriptApp.newTrigger('sendThursdayReminders')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.THURSDAY)
+    .atHour(CONFIG.WEEKLY_SEND_HOUR)   // e.g., 9 for 9am PT
+    .create();
+}
+
+// (Helper) delete all existing project triggers
+function deleteAllTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+function sendThursdayReminders() {
+  const now = new Date();
+
+  // Always send the weekly reminder for the coming Sunday
+  sendWeeklyReminders();
+
+  // If it's the first Thursday (day 1–7), also send the monthly email
+  if (isFirstThursday_(now)) {
+    sendMonthlyReminders();
+    sendGuestPreacherMonthlyReminders();
+
+    // ===== ADDED: monthly evening preacher aggregator =====
+    sendEveningPreacherMonthlyReminders();
+  }
+  if (CONFIG.NOTION_TEAM_SYNC_ENABLED) {
+    try {
+      syncNotionTeamsNext4Weeks();
+    } catch (e) {
+      notifyTeamSyncFailure_(e);
+    }
+  }
+}
+
+function isFirstThursday_(d) {
+  // Thursday is 4 (Sun=0, Mon=1, Tue=2). First Thursday falls on the 1st–7th.
+  return d.getDay() === 4 && d.getDate() <= 7;
+}
+
+function sendWeeklyReminders() {
+  const tz = CONFIG.TIMEZONE;
+  const now = new Date();
+  const nextSunday = getNextSunday_(now);
+  const scheduleSheet = getScheduleSheetForDate_(nextSunday);
+  const weekNum = weekNumberSundayStart_(nextSunday);
+  const sched = readScheduleRowByWeek_(scheduleSheet, weekNum);
+  const serviceDocx = getServiceDocxAttachmentsForDate_(nextSunday); // { morning, evening }
+
+  const hasMorningDoc = !!(serviceDocx && serviceDocx.morning);
+  const hasEveningDoc = !!(serviceDocx && serviceDocx.evening);
+  const needsAnyNotes = !(hasMorningDoc && hasEveningDoc);
+
+  Logger.log(
+    'NOW=' + Utilities.formatDate(now, CONFIG.TIMEZONE, 'yyyy-MM-dd EEE') +
+    '  nextSunday=' + Utilities.formatDate(nextSunday, CONFIG.TIMEZONE, 'yyyy-MM-dd EEE') +
+    '  weekNum=' + weekNum
+  );
+
+  let sermonFormatted = null;
+  if (needsAnyNotes) {
+    const sermonBody = getSermonTextForDate_(nextSunday);
+    sermonFormatted = sermonBody ? formatSermonForEmail_(sermonBody) : null;
+  }
+
+  const NOTES_BY_SERVICE = {
+    morning: {
+      text: (!hasMorningDoc && sermonFormatted && sermonFormatted.text)
+        ? `\nNotes for this Sunday:\n${sermonFormatted.text}\n`
+        : '',
+      html: (!hasMorningDoc && sermonFormatted && sermonFormatted.html)
+        ? sermonFormatted.html
+        : ''
+    },
+    evening: {
+      text: (!hasEveningDoc && sermonFormatted && sermonFormatted.text)
+        ? `\nNotes for this Sunday:\n${sermonFormatted.text}\n`
+        : '',
+      html: (!hasEveningDoc && sermonFormatted && sermonFormatted.html)
+        ? sermonFormatted.html
+        : ''
+    }
+  };
+
+  const guest = getGuestPreacherInfoForDate_(nextSunday); // { name, email }
+
+  // Service Leader email (morning)
+  sendServiceLeaderEmailForDate_(
+    nextSunday,
+    serviceDocx,
+    hasMorningDoc,
+    NOTES_BY_SERVICE.morning.text,
+    NOTES_BY_SERVICE.morning.html
+  );
+
+  // Evening preacher reminders
+  sendEveningPreacherEmailForDate_(nextSunday);
+
+  const twoWeeksOut = new Date(now.getTime());
+  twoWeeksOut.setDate(twoWeeksOut.getDate() + 14);
+  const twoWeeksOutSunday = getNextSunday_(twoWeeksOut);
+  sendEveningPreacherEmailForDate_(twoWeeksOutSunday);
+
+  if (!sched) return;
+
+  const volunteersMap = getVolunteersById_();
+  const headers = getHeaders_(scheduleSheet);
+  const assignments = buildAssignmentsForRow_(sched, headers);
+
+  // Backups
+  const backupCounterId   = String(assignments.backups.counterId || '').trim();
+  const backupAVId        = String(assignments.backups.avId || '').trim();
+  const backupCounterName = lookupFirstName_(volunteersMap, backupCounterId);
+  const backupAVName      = lookupFirstName_(volunteersMap, backupAVId);
+
+  const backupCounterContact =
+    (typeof formatBackupContact_ === 'function') ? formatBackupContact_(volunteersMap, backupCounterId) : '';
+  const backupAVContact =
+    (typeof formatBackupContact_ === 'function') ? formatBackupContact_(volunteersMap, backupAVId) : '';
+
+  const PRIMARY_LABELS = {
+    counting: 'counter',
+    music: 'morning musician',
+    av: 'AV engineer'
+  };
+
+  const SPECIAL_LABELS = {
+    morningLead:  'morning service leader',
+    eveningLead:  'evening service leader',
+    eveningMusic: 'evening music leader',
+    eveningPreach:'evening preacher',
+    guestPreach:  'guest preacher'
+  };
+
+  const dateMMDD = Utilities.formatDate(nextSunday, tz, 'MM/dd');
+  const subjectCommon = `This Sunday ${dateMMDD}: you’re serving`;
+
+  const namesFromIds = (ids) => ids
+    .map(id => String(id || '').trim())
+    .filter(Boolean)
+    .map(id => (volunteersMap[id]?.FirstName || '').trim())
+    .filter(Boolean);
+
+  const teamCounting = namesFromIds(assignments.roles.counting).join(', ');
+  const teamMusic    = namesFromIds(assignments.roles.music).join(', ');
+  const teamAV       = namesFromIds(assignments.roles.av).join(', ');
+
+  const messagesByVolunteer = {};
+
+  function ensureVol(id) {
+    const key = String(id || '').trim();
+    if (!key) return null;
+    const p = volunteersMap[key];
+    if (!p || !p.Email) return null;
+
+    if (!messagesByVolunteer[key]) {
+      messagesByVolunteer[key] = {
+        id: key,
+        email: p.Email,
+        firstName: p.FirstName || '',
+        roles: new Set(),
+
+        // primary flags
+        isCounter: false,
+        isAV: false,
+        isMorningMusician: false,
+
+        // backup flags
+        isCounterBackup: false,
+        isAVBackup: false,
+
+        // special flags
+        isMorningLead: false,
+        isEveningLead: false,
+        isEveningMusic: false,
+        isEveningPreach: false,
+        isGuestPreach: false
+      };
+    }
+    return messagesByVolunteer[key];
+  }
+
+  // Primaries
+  for (const [roleKey, ids] of Object.entries(assignments.roles)) {
+    const label = PRIMARY_LABELS[roleKey];
+    ids.forEach(id => {
+      const m = ensureVol(id);
+      if (!m) return;
+      m.roles.add(label);
+      if (roleKey === 'counting') m.isCounter = true;
+      if (roleKey === 'av') m.isAV = true;
+      if (roleKey === 'music') m.isMorningMusician = true;
+    });
+  }
+
+  // Specials
+  const sp = assignments.specials || {};
+  [
+    ['morningLead','isMorningLead'],
+    ['eveningLead','isEveningLead'],
+    ['eveningMusic','isEveningMusic'],
+    ['eveningPreach','isEveningPreach'],
+    ['guestPreach','isGuestPreach']
+  ].forEach(([field, flag]) => {
+    const id = sp[field];
+    const m = ensureVol(id);
+    if (!m) return;
+    m.roles.add(SPECIAL_LABELS[field]);
+    m[flag] = true;
+  });
+
+  // Backups
+  if (backupCounterId) {
+    const m = ensureVol(backupCounterId);
+    if (m) m.isCounterBackup = true;
+  }
+  if (backupAVId) {
+    const m = ensureVol(backupAVId);
+    if (m) m.isAVBackup = true;
+  }
+
+  Object.values(messagesByVolunteer).forEach(msg => {
+    const serviceProfile = getVolunteerServiceProfile_(msg);
+
+    // backup-only email
+    if (msg.roles.size === 0) {
+      const which = englishJoin_([
+        msg.isCounterBackup ? 'backup counter' : '',
+        msg.isAVBackup ? 'backup AV engineer' : ''
+      ].filter(Boolean));
+      if (!which) return;
+
+      let body = '';
+      body += `Hey ${msg.firstName},\n`;
+      body += `You are receiving this email because you are designated as the ${which} for this week.\n`;
+
+      const notesText = buildNotesTextForVolunteer_(serviceProfile, NOTES_BY_SERVICE);
+      if (notesText) body += notesText + '\n';
+
+      body += `Thank you for volunteering! Your help is much appreciated.\n\n`;
+      body += `Sincerely,\n${CONFIG.FROM_NAME}\n`;
+
+      let htmlBody = escapeHtml_(body).replace(/\n/g, '<br>');
+      const notesHtml = buildNotesHtmlForVolunteer_(serviceProfile, NOTES_BY_SERVICE);
+      if (notesHtml) {
+        htmlBody = buildHtmlBodyWithoutDuplicateNotes_(body, notesHtml);
+      }
+
+      const attachments = getAttachmentsForVolunteer_(serviceDocx, serviceProfile);
+      const mailOpts = {
+        name: CONFIG.FROM_NAME,
+        htmlBody: htmlBody
+      };
+      if (attachments.length) mailOpts.attachments = attachments;
+
+      if (CONFIG.TEST_MODE) {
+        GmailApp.sendEmail(
+          Session.getActiveUser().getEmail(),
+          'TEST: ' + subjectCommon,
+          body,
+          mailOpts
+        );
+      } else {
+        GmailApp.sendEmail(msg.email, subjectCommon, body, mailOpts);
+      }
+      return;
+    }
+
+    const rolesPhrase = englishJoin_(Array.from(msg.roles));
+    let body = '';
+    body += `Hey ${msg.firstName},\n\n`;
+    body += `A friendly reminder that you are serving as a ${rolesPhrase} for this coming Sunday, ${dateMMDD}.\n\n`;
+
+    if (msg.isCounter && teamCounting) {
+      body += `Your counting team this week is: ${teamCounting}\n\n`;
+    }
+    if (msg.isMorningMusician && teamMusic) {
+      body += `Please note that we added a song between the giving prayer and the prayer of petition! Remain on stage until the pastoral prayer. Your music team this week is: ${teamMusic}\n\n`;
+    }
+    if (msg.isAV && teamAV) {
+      body += `Your AV team this week is: ${teamAV}\n\n`;
+    }
+
+    if (msg.isCounter && backupCounterName) {
+      body += `Your backup counter is ${backupCounterName}${backupCounterContact ? ' ' + backupCounterContact : ''}. Please text or call them if you are unable to serve this week!\n\n`;
+    }
+    if (msg.isAV && backupAVName) {
+      body += `Your backup AV engineer is ${backupAVName}${backupAVContact ? ' ' + backupAVContact : ''}. Please text or call them if you are unable to serve this week!\n\n`;
+    }
+
+    const extraBackups = [];
+    if (msg.isCounterBackup) extraBackups.push('backup counter');
+    if (msg.isAVBackup) extraBackups.push('backup AV engineer');
+    if (extraBackups.length) {
+      body += `Additionally, you are designated as the ${englishJoin_(extraBackups)} for this week.\n\n`;
+    }
+
+    const MORNING_TEMPLATE = 'https://docs.google.com/document/d/1HlALA0RZAwQauQmUpXTHtjUyhAIVNOmhgcKvZhWzS4s/edit?usp=sharing';
+    if (msg.isMorningLead) {
+      body += `Here is a link to the morning service leading template: ${MORNING_TEMPLATE}\n\n`;
+    }
+    if (msg.isEveningMusic) {
+      body += `Evening music: please come early enough to practice and sound check! feel free to ask other musicians if they would like to join you.\n\n`;
+    }
+    if (msg.isEveningPreach) {
+      body += `Evening preaching: thank you for sharing the word this evening.\n\n`;
+    }
+    if (msg.isGuestPreach) {
+      body += `We're excited to hear God's word through you this coming Sunday! Guest preaching details: We typically have the guest speaker come up after the time of giving and lead us in a pastoral prayer, followed by the sermon, followed by a final song. After the song, please share a benediction to conclude the gathering.\n\n`;
+    }
+
+    const notesText = buildNotesTextForVolunteer_(serviceProfile, NOTES_BY_SERVICE);
+    if (notesText) {
+      body += notesText + '\n';
+    }
+
+    body += `Thank you for volunteering! Your help is much appreciated.\n\n`;
+    body += `Sincerely,\n${CONFIG.FROM_NAME}\n`;
+
+    const notesHtml = buildNotesHtmlForVolunteer_(serviceProfile, NOTES_BY_SERVICE);
+    let htmlBody = notesHtml
+      ? buildHtmlBodyWithoutDuplicateNotes_(body, notesHtml)
+      : escapeHtml_(body).replace(/\n/g, '<br>');
+
+    const attachments = getAttachmentsForVolunteer_(serviceDocx, serviceProfile);
+    const sendOpts = {
+      name: CONFIG.FROM_NAME,
+      htmlBody: htmlBody
+    };
+    if (attachments.length) sendOpts.attachments = attachments;
+
+    if (CONFIG.TEST_MODE) {
+      GmailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'TEST: ' + subjectCommon,
+        body,
+        sendOpts
+      );
+    } else {
+      GmailApp.sendEmail(msg.email, subjectCommon, body, sendOpts);
+    }
+  });
+
+  // Guest preacher email (morning service)
+  if (guest.email) {
+    const gFirst = firstName_(guest.name);
+    const subjectGuest = `This Sunday ${dateMMDD}: guest preaching`;
+
+    const gDoc = (serviceDocx && serviceDocx.morning) ? serviceDocx.morning : null;
+
+    let gBody = '';
+    gBody += (gFirst ? `Hey ${gFirst},\n\n` : 'Hello,\n\n');
+    gBody += `Thank you for bringing God's word to First Baptist Church of Artesia this coming Sunday, ${dateMMDD}. `;
+    gBody += `In case John is absent, we typically have the guest speaker come up after the time of giving and lead us in a pastoral prayer, followed by the sermon, followed by a final song. `;
+    gBody += `After the song, please share a benediction to conclude the gathering.\n\n`;
+    gBody += `Please clarify with John if there is any confusion!\n\n`;
+
+    if (NOTES_BY_SERVICE.morning.text) {
+      gBody += NOTES_BY_SERVICE.morning.text + '\n';
+    }
+
+    gBody += `Thanks again!\n\n`;
+    gBody += `Sincerely,\n${CONFIG.FROM_NAME}\n`;
+
+    let gHtmlBody = NOTES_BY_SERVICE.morning.html
+      ? buildHtmlBodyWithoutDuplicateNotes_(gBody, NOTES_BY_SERVICE.morning.html)
+      : escapeHtml_(gBody).replace(/\n/g, '<br>');
+
+    const gOpts = { name: CONFIG.FROM_NAME, htmlBody: gHtmlBody };
+    if (gDoc) gOpts.attachments = [gDoc];
+
+    if (CONFIG.TEST_MODE) {
+      GmailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'TEST: ' + subjectGuest,
+        gBody,
+        gOpts
+      );
+    } else {
+      GmailApp.sendEmail(guest.email, subjectGuest, gBody, gOpts);
+    }
+  }
+}
+
+function sendMonthlyReminders() {
+  const tz = CONFIG.TIMEZONE;
+  const now = new Date();
+  const startMonth0 = now.getMonth();        // 0..11
+  const startYear   = now.getFullYear();
+
+  // Current month + next month
+  const months = [
+    { y: startYear, m: startMonth0 },
+    { y: startYear + Math.floor((startMonth0 + 1) / 12), m: (startMonth0 + 1) % 12 }
+  ];
+  const sundays = [];
+  months.forEach(({y, m}) => sundays.push(...allSundaysInMonth_(y, m)));
+  if (sundays.length === 0) return;
+
+  const volunteersMap = getVolunteersById_();
+
+  // id => {email, firstName, dates:[{date, roles:Set, isCounterBackup, isAVBackup}]}
+  const perVolunteer = {};
+
+  function ensureSlot(id, d) {
+    const key = String(id || '').trim();
+    if (!key) return null;
+    const p = volunteersMap[key];
+    if (!p || !p.Email) return null;
+    if (!perVolunteer[key]) {
+      perVolunteer[key] = { email: p.Email, firstName: p.FirstName || '', dates: [] };
+    }
+    let slot = perVolunteer[key].dates.find(x => sameDate_(x.date, d));
+    if (!slot) {
+      slot = { date: new Date(d), roles: new Set(), isCounterBackup: false, isAVBackup: false };
+      perVolunteer[key].dates.push(slot);
+    }
+    return slot;
+  }
+
+  // Collect assignments for every Sunday in the two-month window
+  for (const d of sundays) {
+    const sheetForYear = getScheduleSheetByYear_(d.getFullYear());
+    const headers = getHeaders_(sheetForYear);
+    const weekNum = weekNumberSundayStart_(d);
+    const sched = readScheduleRowByWeek_(sheetForYear, weekNum);
+    if (!sched) continue;
+
+    const assignments = buildAssignmentsForRow_(sched, headers);
+
+    // Primary roles
+    (assignments.roles?.counting || []).forEach(id => {
+      const slot = ensureSlot(id, d); if (slot) slot.roles.add('counter');
+    });
+    (assignments.roles?.music || []).forEach(id => {
+      const slot = ensureSlot(id, d); if (slot) slot.roles.add('morning musician');
+    });
+    (assignments.roles?.av || []).forEach(id => {
+      const slot = ensureSlot(id, d); if (slot) slot.roles.add('AV engineer');
+    });
+
+    // NEW: special roles (single ID each)
+    const sp = assignments.specials || {};
+    [
+      [sp.morningLead,  'morning service leader'],
+      [sp.eveningLead,  'evening service leader'],
+      [sp.eveningMusic, 'evening music leader'],
+      [sp.eveningPreach,'evening preacher'],
+      [sp.guestPreach,  'guest preacher']
+    ].forEach(([id, label]) => {
+      const slot = ensureSlot(id, d); if (slot) slot.roles.add(label);
+    });
+
+    // Backups (flags only; listed in their own section)
+    const cb = String(assignments.backups?.counterId || '').trim();
+    const ab = String(assignments.backups?.avId || '').trim();
+    if (cb) { const slot = ensureSlot(cb, d); if (slot) slot.isCounterBackup = true; }
+    if (ab) { const slot = ensureSlot(ab, d); if (slot) slot.isAVBackup = true; }
+  }
+
+  // Subject range label
+  const rangeLabel = (() => {
+    const d1 = new Date(months[0].y, months[0].m, 1);
+    const d2 = new Date(months[1].y, months[1].m, 1);
+    const sameYear = d1.getFullYear() === d2.getFullYear();
+    const m1 = Utilities.formatDate(d1, tz, 'MMMM');
+    const m2 = Utilities.formatDate(d2, tz, 'MMMM');
+    return sameYear ? `${m1}–${m2} ${d1.getFullYear()}`
+                    : `${m1} ${d1.getFullYear()}–${m2} ${d2.getFullYear()}`;
+  })();
+
+  // Send emails
+  Object.entries(perVolunteer).forEach(([id, rec]) => {
+    // Aggregate overall roles (across dates) for the intro sentence
+    const rolesSet = new Set();
+    rec.dates.forEach(s => s.roles.forEach(r => rolesSet.add(r)));
+    const rolesPhrase = englishJoin_(Array.from(rolesSet));
+
+    // Lines: "Month d, yyyy (role, role)"
+    const primaryLines = rec.dates
+      .filter(s => s.roles.size > 0)
+      .sort((a, b) => a.date - b.date)
+      .map(s => {
+        const label = Utilities.formatDate(s.date, tz, 'MMMM d, yyyy');
+        const roleList = englishJoin_(Array.from(s.roles));
+        return `- ${label} (${roleList})`;
+      })
+      .join('\n');
+
+    // Backup sections
+    const counterBackupDates = rec.dates
+      .filter(s => s.isCounterBackup)
+      .sort((a, b) => a.date - b.date)
+      .map(s => `- ${Utilities.formatDate(s.date, tz, 'MMMM d, yyyy')}`)
+      .join('\n');
+
+    const avBackupDates = rec.dates
+      .filter(s => s.isAVBackup)
+      .sort((a, b) => a.date - b.date)
+      .map(s => `- ${Utilities.formatDate(s.date, tz, 'MMMM d, yyyy')}`)
+      .join('\n');
+
+    if (rolesSet.size === 0 && !counterBackupDates && !avBackupDates) {
+      // nothing for this person in the window
+      return;
+    }
+
+    let body = '';
+    
+    body += `Hey ${rec.firstName},\n`;
+
+    if (rolesSet.size > 0) {
+      body += `You are receiving this email because you are serving as: ${rolesPhrase} for the following weeks in the next two months:\n \n`;
+      body += `${primaryLines}\n`;
+    }
+
+    if (counterBackupDates || avBackupDates) {
+      if (rolesSet.size > 0) body += `\n`;
+      body += `Backup assignments in the next two months:\n`;
+      if (counterBackupDates) body += `Back up counter:\n${counterBackupDates}\n`;
+      if (avBackupDates) body += `Back up AV engineer:\n${avBackupDates}\n`;
+    }
+
+    body += `\nThank you for volunteering! Your help is much appreciated.\n\n`;
+    body += `Sincerely,\n${CONFIG.FROM_NAME}\n`;
+
+    const subject = `Your volunteer dates for the next two months (${rangeLabel})`;
+    if (CONFIG.TEST_MODE) {
+      // Redirect all emails to yourself
+      GmailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'TEST: ' + subject,
+        body
+      );
+    } 
+    else {
+      GmailApp.sendEmail(rec.email, subject, body);
+    }
+    return;
+  });
+}
+
+function sendGuestPreacherMonthlyReminders() {
+  if (!NOTION.ENABLED) return;
+
+  const tz = CONFIG.TIMEZONE;
+  const now = new Date();
+  const startMonth0 = now.getMonth();
+  const startYear   = now.getFullYear();
+
+  // Build current + next month Sundays
+  const months = [
+    { y: startYear,                           m: startMonth0 },
+    { y: startYear + Math.floor((startMonth0 + 1) / 12), m: (startMonth0 + 1) % 12 }
+  ];
+  const sundays = [];
+  months.forEach(({y, m}) => sundays.push(...allSundaysInMonth_(y, m)));
+  if (!sundays.length) return;
+
+  // Label for subject
+  const rangeLabel = (() => {
+    const d1 = new Date(months[0].y, months[0].m, 1);
+    const d2 = new Date(months[1].y, months[1].m, 1);
+    const sameYear = d1.getFullYear() === d2.getFullYear();
+    const m1 = Utilities.formatDate(d1, tz, 'MMMM');
+    const m2 = Utilities.formatDate(d2, tz, 'MMMM');
+    return sameYear ? `${m1}–${m2} ${d1.getFullYear()}` : `${m1} ${d1.getFullYear()}–${m2} ${d2.getFullYear()}`;
+  })();
+
+  // Collect dates per guest email
+  const perGuest = {}; // email(lower) => { name, email, dates: [Date] }
+
+  for (const d of sundays) {
+    const iso = Utilities.formatDate(d, 'UTC', 'yyyy-MM-dd');
+    const rows = queryRowsByDate_(iso); // your existing Notion DB query
+    if (!rows || !rows.length) continue;
+
+    rows.forEach(row => {
+      const props = row.properties || {};
+      const name  = notionPropToString_(props[NOTION.PREACHER_NAME_PROP]);
+      const email = notionPropToString_(props[NOTION.GUEST_EMAIL_PROP]);
+      if (!email) return;
+      const key = email.toLowerCase();
+      if (!perGuest[key]) perGuest[key] = { name: name || '', email, dates: [] };
+      perGuest[key].dates.push(new Date(d));
+    });
+  }
+
+  // Send one email per guest with all dates
+  Object.values(perGuest).forEach(g => {
+    if (!g.dates.length) return;
+
+    const lines = g.dates
+      .sort((a, b) => a - b)
+      .map(dt => `- ${Utilities.formatDate(dt, tz, 'MMMM d, yyyy')}`)
+      .join('\n');
+
+    const fname = firstName_(g.name);
+    let body = '';
+    body += (fname ? `Hey ${fname},\n\n` : 'Hello,\n');
+    body += `You are receiving this email because you are scheduled to guest preach at First Baptist Church of Artesia on the following Sundays in the next two months:\n\n`;
+    body += `${lines}\n\n`;
+    body += `Flow: If John is absent, after the time of giving, please lead us in a pastoral prayer, then preach the sermon, then we’ll sing a closing song. After the song, please share a benediction to conclude the gathering. Please clarify with John if there is any confusion! \n\n`;
+    body += `Thank you for serving our church!\n\n`;
+    body += `Sincerely,\n${CONFIG.FROM_NAME}\n`;
+
+    const subject = `FBCA Guest Preaching Dates (${rangeLabel})`;
+    if (CONFIG.TEST_MODE) {
+      // Redirect all emails to yourself
+      GmailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'TEST: ' + subject,
+        body
+      );
+    } 
+    else {
+      GmailApp.sendEmail(g.email, subject, body);
+    }
+    return;
+  });
+}
+
+
+/* =========================================================
+ * ===== ADDED: Evening Preacher monthly + weekly senders ===
+ * ========================================================= */
+
+function getEveningPreacherInfoForDate_(dateLike) {
+  if (!NOTION.ENABLED) return { name: '', email: '', passage: '' };
+
+  const iso = toIsoDate_(dateLike);
+  const rows = queryRowsByDate_(iso);
+  if (!rows.length) return { name: '', email: '', passage: '' };
+
+  for (const row of rows) {
+    const props = row.properties || {};
+    const name = notionPropToString_(props[NOTION.EVENING_PREACHER_NAME_PROP]);
+    const email = notionPropToString_(props[NOTION.EVENING_PREACHER_EMAIL_PROP]);
+    const passage = notionPropToString_(props[NOTION.EVENING_PASSAGE_PROP]);
+
+    if (email) {
+      return { name: name || '', email, passage: passage || '' };
+    }
+  }
+  return { name: '', email: '', passage: '' };
+}
+
+function sendEveningPreacherEmailForDate_(serviceDate) {
+  const tz = CONFIG.TIMEZONE;
+
+  const info = getEveningPreacherInfoForDate_(serviceDate); // {name,email,passage}
+  if (!info.email) return;
+
+  const serviceDocx = getServiceDocxAttachmentsForDate_(serviceDate);
+  const eDoc = serviceDocx && serviceDocx.evening ? serviceDocx.evening : null;
+  const eOpts = {};
+  if (eDoc) eOpts.attachments = [eDoc];
+
+  const nameFirst = firstName_(info.name) || info.name || 'there';
+  const dateLabel = Utilities.formatDate(serviceDate, tz, 'MM/dd');
+  const passage = String(info.passage || '').trim();
+
+  const subject = `Evening preaching reminder (${dateLabel})`;
+
+  let body = '';
+  body += `Hello ${nameFirst},\n\n`;
+  if (passage) {
+    body += `You are scheduled to preach on ${passage} on ${dateLabel}.\n\n`;
+  } else {
+    body += `You are scheduled to preach on ${dateLabel}.\n\n`;
+  }
+  body += `Thanks!\n\n`;
+  body += `${CONFIG.FROM_NAME}\n`;
+
+  if (CONFIG.TEST_MODE) {
+    GmailApp.sendEmail(Session.getActiveUser().getEmail(), 'TEST: ' + subject, body, eOpts);
+  } 
+  else {
+    GmailApp.sendEmail(info.email, subject, body, eOpts);
+  }
+}
+
+function sendEveningPreacherMonthlyReminders() {
+  if (!NOTION.ENABLED) return;
+
+  const tz = CONFIG.TIMEZONE;
+  const now = new Date();
+  const startMonth0 = now.getMonth();
+  const startYear = now.getFullYear();
+
+  // Current month + next month
+  const months = [
+    { y: startYear, m: startMonth0 },
+    { y: startYear + Math.floor((startMonth0 + 1) / 12), m: (startMonth0 + 1) % 12 }
+  ];
+
+  const sundays = [];
+  months.forEach(({ y, m }) => sundays.push(...allSundaysInMonth_(y, m)));
+  if (!sundays.length) return;
+
+  const rangeLabel = (() => {
+    const d1 = new Date(months[0].y, months[0].m, 1);
+    const d2 = new Date(months[1].y, months[1].m, 1);
+    const sameYear = d1.getFullYear() === d2.getFullYear();
+    const m1 = Utilities.formatDate(d1, tz, 'MMMM');
+    const m2 = Utilities.formatDate(d2, tz, 'MMMM');
+    return sameYear ? `${m1}–${m2} ${d1.getFullYear()}` : `${m1} ${d1.getFullYear()}–${m2} ${d2.getFullYear()}`;
+  })();
+
+  // email(lower) -> { name, email, items: [{date, passage}] }
+  const perPreacher = {};
+
+  for (const d of sundays) {
+    const info = getEveningPreacherInfoForDate_(d);
+    if (!info.email) continue;
+
+    const key = info.email.toLowerCase();
+    if (!perPreacher[key]) perPreacher[key] = { name: info.name || '', email: info.email, items: [] };
+
+    perPreacher[key].items.push({
+      date: new Date(d),
+      passage: String(info.passage || '').trim()
+    });
+  }
+
+  Object.values(perPreacher).forEach(p => {
+    if (!p.items.length) return;
+
+    const fname = firstName_(p.name) || p.name || 'there';
+
+    const lines = p.items
+      .sort((a, b) => a.date - b.date)
+      .map(it => {
+        const dLabel = Utilities.formatDate(it.date, tz, 'MMMM d, yyyy');
+        return it.passage ? `- ${dLabel} — ${it.passage}` : `- ${dLabel}`;
+      })
+      .join('\n');
+
+    const subject = `Evening preaching schedule (${rangeLabel})`;
+
+    let body = '';
+    body += `Hello ${fname},\n\n`;
+    body += `You are scheduled to preach on the following dates:\n\n`;
+    body += `${lines}\n\n`;
+    body += `Thanks!\n\n`;
+    body += `${CONFIG.FROM_NAME}\n`;
+
+    if (CONFIG.TEST_MODE) {
+      GmailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'TEST: ' + subject,
+        body
+      );
+    } else {
+      GmailApp.sendEmail(p.email, subject, body);
+    }
+  });
+}
+
+
+
+/* ===========================
+ * (rest of your file continues)
+ * ===========================
+ * Everything below here is unchanged from what you pasted.
+ */
+
+
+// ========== Helpers: reading sheets ==========
+function getScheduleSheetForDate_(date) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const year = String(date.getFullYear());
+  let sh = ss.getSheetByName(year);
+
+  // fallback to CONFIG if needed
+  if (!sh) sh = ss.getSheetByName(CONFIG.SCHED_SHEET);
+
+  if (!sh) throw new Error(`Schedule sheet for year ${year} not found`);
+  return sh;
+}
+
+function getVolunteersSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(CONFIG.VOL_SHEET);
+  if (!sh) throw new Error(`Volunteers sheet "${CONFIG.VOL_SHEET}" not found`);
+  return sh;
+}
+
+function getHeaders_(sheet) {
+  return sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+}
+
+function indexMap_(headers) {
+  const map = {};
+  headers.forEach((h, i) => map[h] = i);
+  return map;
+}
+
+function readScheduleRowByWeek_(sheet, weekNum) {
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const idx = indexMap_(headers);
+  const weekIdx = idx['Week'];
+  if (weekIdx == null) throw new Error('No "Week" column found in schedule sheet');
+  for (let r = 1; r < data.length; r++) {
+    if (Number(data[r][weekIdx]) === weekNum) {
+      return data[r];
+    }
+  }
+  return null;
+}
+
+function getVolunteersById_() {
+  const sh = getVolunteersSheet_();
+  const values = sh.getDataRange().getValues();
+  const headers = values[0];
+  const idx = indexMap_(headers);
+
+  const map = {};
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const id = String(row[idx['ID']] ?? '').trim();
+    if (!id) continue;
+    map[id] = {
+      FirstName: row[idx['FirstName']] || '',
+      LastName: row[idx['LastName']] || '',
+      Email: row[idx['Email']] || '',
+      PhoneNumber: row[idx['PhoneNumber']] || '',
+      rowIndex: r + 1, // 1-based for setValue
+      ServiceCounterCol: idx['ServiceCounter'] != null ? idx['ServiceCounter'] + 1 : null
+    };
+  }
+  return map;
+}
+
+function lookupFirstName_(volunteersMap, id) {
+  const key = String(id || '').trim();
+  return key && volunteersMap[key] ? volunteersMap[key].FirstName : '';
+}
+
+// Build assignment lists for a given schedule row
+function buildAssignmentsForRow_(row, headers) {
+  const idx = indexMap_(headers);
+
+  const roles = {
+    counting: COLS.COUNTING_PRIMARIES.map(c => row[idx[c]]).filter(v => v !== '' && v != null),
+    music:    COLS.MUSIC.map(c => row[idx[c]]).filter(v => v !== '' && v != null),
+    av:       COLS.AV_PRIMARIES.map(c => row[idx[c]]).filter(v => v !== '' && v != null),
+  };
+
+  const backups = {
+    counterId: row[idx[COLS.COUNTING_BACKUP]] || '',
+    avId:      row[idx[COLS.AV_BACKUP]] || ''
+  };
+
+  const specials = {
+    morningLead:  row[idx[COLS.MORNING_LEAD]]  || '',
+    eveningLead:  row[idx[COLS.EVENING_LEAD]]  || '',
+    eveningMusic: row[idx[COLS.EVENING_MUSIC]] || '',
+    eveningPreach:row[idx[COLS.EVENING_PREACH]]|| '',
+    guestPreach:  row[idx[COLS.GUEST_PREACH]]  || ''
+  };
+
+  return { roles, backups, specials };
+}
+
+function getScheduleSheetByYear_(year) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // Try a year-named tab first (e.g., "2025"). Fallback to CONFIG.SCHED_SHEET.
+  let sh = ss.getSheetByName(String(year));
+  if (!sh) sh = ss.getSheetByName(CONFIG.SCHED_SHEET);
+  if (!sh) throw new Error(`Schedule sheet for year ${year} not found`);
+  return sh;
+}
+
+function formatBackupContact_(volunteersMap, id) {
+  const key = String(id || '').trim();
+  if (!key || !volunteersMap[key]) return '';
+  const phone = String(volunteersMap[key].PhoneNumber || '').trim();
+  if (phone) return `(Phone Number: ${phone})`;
+  const email = String(volunteersMap[key].Email || '').trim();
+  if (email) return `(Email: ${email})`;
+  return '';
+}
+
+
+// ========== Helpers: dates & weeks ==========
+function getNextSunday_(fromDate) {
+  const d = new Date(fromDate);
+  const delta = (7 - d.getDay()) % 7; // Sun=0
+  d.setDate(d.getDate() + delta);
+  d.setHours(12, 0, 0, 0); // noon to avoid DST edges
+  return d;
+}
+
+// Week number where Week 1 = first Sunday of the year
+function weekNumberSundayStart_(date) {
+  const y = date.getFullYear();
+
+  // first Sunday ON/AFTER Jan 1 (same rule as your original)
+  const jan1 = new Date(y, 0, 1);
+  const firstSunday = new Date(y, 0, 1 + ((7 - jan1.getDay()) % 7));
+
+  // Use UTC midnight for both dates so DST can't change the math
+  const utcDate = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  const utcFirstSunday = Date.UTC(firstSunday.getFullYear(), firstSunday.getMonth(), firstSunday.getDate());
+
+  const diffDays = Math.floor((utcDate - utcFirstSunday) / 86400000);
+  return diffDays < 0 ? 1 : Math.floor(diffDays / 7) + 1;
+}
+
+function dateAtNoon_(d) {
+  const copy = new Date(d);
+  copy.setHours(12, 0, 0, 0);
+  return copy.getTime();
+}
+
+// All Sundays within a given month
+function allSundaysInMonth_(year, month0) {
+  const tz = CONFIG.TIMEZONE;
+  const first = new Date(year, month0, 1);
+  let d = new Date(first);
+  const add = (7 - d.getDay()) % 7; // next Sunday on/after the 1st
+  d.setDate(d.getDate() + add);
+  d.setHours(12, 0, 0, 0);
+
+  const sundays = [];
+  while (d.getMonth() === month0) {
+    sundays.push(new Date(d));
+    d.setDate(d.getDate() + 7);
+  }
+  return sundays;
+}
+
+function sameDate_(a, b) {
+  return a.getFullYear() === b.getFullYear() &&
+         a.getMonth() === b.getMonth() &&
+         a.getDate() === b.getDate();
+}
+
+// ========== Helpers: text / utils ==========
+function englishJoin_(arr) {
+  const a = arr.filter(Boolean);
+  if (a.length <= 1) return a.join('');
+  if (a.length === 2) return `${a[0]} and ${a[1]}`;
+  return `${a.slice(0, -1).join(', ')}, and ${a[a.length - 1]}`;
+}
+
+function uniqueNonEmpty_(arr) {
+  const set = new Set(arr.filter(x => (x || '').trim() !== ''));
+  return Array.from(set);
+}
+
+function isInFirstWeekOfMonth_(d) {
+  // First week = days 1..7
+  return d.getDate() <= 7;
+}
+
+// ========== Optional: ServiceCounter increment (once per Sunday) ==========
+function incrementServiceCountersOncePerWeek_(sundayDate, volunteerIds) {
+  const props = PropertiesService.getScriptProperties();
+  const key = `processed_${Utilities.formatDate(sundayDate, CONFIG.TIMEZONE, 'yyyy-MM-dd')}`;
+  if (props.getProperty(key) === '1') return; // already processed
+
+  const volSheet = getVolunteersSheet_();
+  const volunteersMap = getVolunteersById_();
+
+  // Increment each volunteer's ServiceCounter by 1
+  const updates = [];
+  volunteerIds.forEach(id => {
+    const v = volunteersMap[String(id)];
+    if (!v || v.ServiceCounterCol == null) return;
+    const cell = volSheet.getRange(v.rowIndex, v.ServiceCounterCol);
+    const current = Number(cell.getValue() || 0);
+    cell.setValue(current + 1);
+  });
+
+  props.setProperty(key, '1');
+}
+
+// ====== Notion helpers ========
+function getScriptProp_(key) {
+  return (PropertiesService.getScriptProperties().getProperty(key) || '').trim();
+}
+
+function notionHeaders_() {
+  const token = getScriptProp_('NOTION_TOKEN');
+  if (!token) throw new Error('NOTION_TOKEN not set in Script properties.');
+  return {
+    'Authorization': 'Bearer ' + token,
+    'Notion-Version': NOTION.API_VERSION,
+    'Content-Type': 'application/json'
+  };
+}
+
+// Convert Date or 'YYYY/MM/DD' or 'YYYY-MM-DD' -> 'YYYY-MM-DD'
+function toIsoDate_(dateLike) {
+  const s = (Object.prototype.toString.call(dateLike) === '[object Date]')
+    ? Utilities.formatDate(dateLike, 'UTC', 'yyyy-MM-dd')
+    : String(dateLike).trim();
+  if (/^\d{4}\/\d{2}\/\d{2}$/.test(s)) return s.replace(/\//g, '-');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  throw new Error('Unrecognized date format');
+}
+
+// Extract a 32-hex Notion page id from a full URL
+function extractPageIdFromUrl_(url) {
+  if (!url) return '';
+  const m = String(url).match(/[a-f0-9]{32}/i);
+  return m ? m[0] : '';
+}
+
+function fetchNotionPageText_(pageId, maxChars) {
+  if (!pageId) return '';
+  const text = fetchBlockRecursive_(pageId, 0).join('\n');
+  if (maxChars && text.length > maxChars)
+    return text.slice(0, maxChars) + '…';
+  return text;
+}
+
+function fetchBlockRecursive_(blockId, indentLevel) {
+  const url = `https://api.notion.com/v1/blocks/${blockId}/children?page_size=100`;
+  const resp = UrlFetchApp.fetch(url, { headers: notionHeaders_(), muteHttpExceptions: true });
+  if (resp.getResponseCode() !== 200) return [];
+
+  const json = JSON.parse(resp.getContentText());
+  let lines = [];
+
+  json.results.forEach(block => {
+    const text = extractBlockTextRecursive_(block, indentLevel);
+    if (text) lines.push(text);
+
+    if (block.has_children) {
+      const childLines = fetchBlockRecursive_(block.id, indentLevel + 2);
+      lines = lines.concat(childLines);
+    }
+  });
+
+  return lines;
+}
+
+function extractBlockTextRecursive_(block, indentLevel) {
+  const type = block.type;
+  const body = block[type];
+  if (!body) return '';
+
+  if (type === 'code') return '';
+
+  const rich = (body.rich_text || [])
+      .map(r => r.plain_text || '')
+      .join('')
+      .trim();
+
+  if (!rich) return '';
+
+  const indent = '       '.repeat(indentLevel);
+
+  switch (type) {
+    case 'heading_1': return indent + rich.toUpperCase();
+    case 'heading_2':
+    case 'heading_3':
+    case 'paragraph': return indent + rich;
+    case 'bulleted_list_item': return indent + '• ' + rich;
+    case 'numbered_list_item': return indent + rich; // already "1. ", "2. " etc.
+    case 'quote': return indent + '"' + rich + '"';
+    case 'callout': return indent + rich;
+    case 'to_do': return indent + (body.checked ? '[x] ' : '[ ] ') + rich;
+    default: return indent + rich;
+  }
+}
+
+// For 2025-09-03 only: discover data_source_id for a database id (cached)
+function getDataSourceIdForDb_(dbId) {
+  if (NOTION.API_VERSION !== '2025-09-03') return ''; // not needed on older API
+  const props = PropertiesService.getScriptProperties();
+  const cacheKey = 'DS_FOR_' + dbId;
+  const cached = props.getProperty(cacheKey);
+  if (cached) return cached;
+
+  const resp = UrlFetchApp.fetch(`https://api.notion.com/v1/databases/${dbId.replace(/-/g,'')}`, {
+    headers: notionHeaders_(), muteHttpExceptions: true
+  });
+  if (resp.getResponseCode() !== 200) throw new Error('GET database failed: ' + resp.getContentText());
+  const json = JSON.parse(resp.getContentText());
+  const list = json.data_sources || [];
+  if (!list.length) throw new Error('No data_sources on this database.');
+  const chosen = NOTION.DATA_SOURCE_NAME
+    ? (list.find(d => d.name === NOTION.DATA_SOURCE_NAME) || list[0])
+    : list[0];
+  props.setProperty(cacheKey, chosen.id);
+  return chosen.id;
+}
+
+// Query rows by ISO date from the database (or data source if on 2025 API)
+function queryRowsByDate_(isoDate) {
+  const dbId = NOTION.DB_ID.replace(/-/g,'');
+  const payload = {
+    filter: { property: NOTION.DATE_PROP, date: { equals: isoDate } },
+    page_size: 50
+  };
+  let url = `https://api.notion.com/v1/databases/${dbId}/query`;
+
+  if (NOTION.API_VERSION === '2025-09-03') {
+    const dsId = getDataSourceIdForDb_(dbId);
+    url = `https://api.notion.com/v1/data_sources/${dsId.replace(/-/g,'')}/query`;
+  }
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: notionHeaders_(),
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  if (resp.getResponseCode() !== 200) {
+    throw new Error('Notion DB query failed: ' + resp.getContentText());
+  }
+  const data = JSON.parse(resp.getContentText());
+  return data.results || [];
+}
+
+// Return the combined body text of all rows whose Date equals the given date.
+// Accepts Date, 'YYYY/MM/DD', or 'YYYY-MM-DD'.
+function getSermonTextForDate_(dateLike) {
+  if (!NOTION.ENABLED) return '';
+  const iso = toIsoDate_(dateLike);          // e.g., 2025-11-09
+  const rows = queryRowsByDate_(iso);        // already in your file
+  if (!rows.length) return '';
+
+  const parts = [];
+  rows.forEach(row => {
+    // Each "row" is a page — its id can be read directly:
+    const pageId = row.id.replace(/-/g,'');
+    const body = fetchNotionPageText_(pageId, NOTION.MAX_CHARS);
+    if (body) parts.push(body);
+  });
+
+  return parts.join('\n\n---\n\n');
+}
+
+function debugPullSermon() {
+  const sample = '2025/11/09'; // your format
+  const txt = getSermonTextForDate_(sample);
+  Logger.log(txt || '(no sermon text found)');
+}
+
+// Turn a Notion property value into a string (handles common types)
+function notionPropToString_(prop) {
+  if (!prop || !prop.type) return '';
+  switch (prop.type) {
+    case 'title':
+    case 'rich_text':
+      return (prop[prop.type] || []).map(r => r.plain_text || '').join('').trim();
+    case 'email':
+      return String(prop.email || '').trim();
+    case 'people':
+      return (prop.people || []).map(p => p.name || '').filter(Boolean).join(', ');
+    case 'select':
+      return (prop.select && prop.select.name) ? prop.select.name : '';
+    case 'multi_select':
+      return (prop.multi_select || []).map(s => s.name || '').filter(Boolean).join(', ');
+    case 'url':
+      return String(prop.url || '').trim();
+    case 'formula':
+      if (!prop.formula) return '';
+      // common formula result types
+      if (prop.formula.type === 'string') return String(prop.formula.string || '').trim();
+      if (prop.formula.type === 'number') return String(prop.formula.number ?? '').trim();
+      if (prop.formula.type === 'boolean') return prop.formula.boolean ? 'true' : 'false';
+      return '';
+    default:
+      return '';
+  }
+}
+
+function firstName_(full) {
+  const s = String(full || '').trim();
+  if (!s) return '';
+  return s.split(/\s+/)[0];
+}
+
+// Find the guest preacher's name/email on the row page for the given date
+function getGuestPreacherInfoForDate_(dateLike) {
+  if (!NOTION.ENABLED) return { name: '', email: '' };
+  const iso = toIsoDate_(dateLike);
+  const rows = queryRowsByDate_(iso);
+  if (!rows.length) return { name: '', email: '' };
+
+  for (const row of rows) {
+    const props = row.properties || {};
+    const name = notionPropToString_(props[NOTION.PREACHER_NAME_PROP]);
+    const email = notionPropToString_(props[NOTION.GUEST_EMAIL_PROP]);
+    if (email) {
+      return { name: name || '', email };
+    }
+  }
+  return { name: '', email: '' };
+}
+
+/**
+ * Try to find a volunteer by matching full name against volunteers sheet.
+ * Match rules:
+ * - case-insensitive
+ * - ignores extra spaces
+ * - compares "First Last" and also allows "Last, First"
+ */
+function findVolunteerByFullName_(volunteersMap, fullName) {
+  const target = String(fullName || '').trim();
+  if (!target) return null;
+
+  const norm = (s) => String(s || '')
+    .toLowerCase()
+    .replace(/[.\u2019']/g, '')   // remove periods/apostrophes
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const t = norm(target);
+
+  // Split target into parts for simple rearrange matching
+  // (handles "Last, First" too)
+  let tFirstLast = t;
+  if (t.includes(',')) {
+    const parts = t.split(',').map(x => x.trim()).filter(Boolean);
+    if (parts.length >= 2) tFirstLast = norm(parts.slice(1).join(' ') + ' ' + parts[0]);
+  }
+
+  for (const [id, v] of Object.entries(volunteersMap)) {
+    const first = norm(v.FirstName);
+    const last  = norm(v.LastName);
+    const fl = norm(`${first} ${last}`);
+    if (!fl) continue;
+
+    if (fl === t || fl === tFirstLast) {
+      return { id, ...v };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Pull Service Leader name from Notion row for the given date.
+ * Returns { name: 'Full Name' } or { name: '' }
+ */
+function getServiceLeaderInfoForDate_(dateLike) {
+  if (!NOTION.ENABLED) return { name: '' };
+
+  const iso = toIsoDate_(dateLike);
+  const rows = queryRowsByDate_(iso);
+  if (!rows || !rows.length) return { name: '' };
+
+  for (const row of rows) {
+    const props = row.properties || {};
+    const name = notionPropToString_(props[NOTION.SERVICE_LEADER_PROP]);
+    if (name) return { name: name || '' };
+  }
+  return { name: '' };
+}
+
+/**
+ * Send the Service Leader email for a given service date.
+ * - Looks up name in Notion (Service Leader)
+ * - Finds email in volunteers sheet by name
+ * - Attaches morning docx (if present)
+ * - Includes notes only if morning doc is missing (same as your existing rule)
+ */
+function sendServiceLeaderEmailForDate_(serviceDate, serviceDocxObj, hasMorningDoc, NOTES_TEXT_BLOCK, NOTES_HTML_BLOCK) {
+  const tz = CONFIG.TIMEZONE;
+
+  const info = getServiceLeaderInfoForDate_(serviceDate); // {name}
+  const fullName = String(info.name || '').trim();
+  if (!fullName) return;
+
+  const volunteersMap = getVolunteersById_();
+  const match = findVolunteerByFullName_(volunteersMap, fullName);
+  if (!match || !match.Email) {
+    Logger.log(`Service Leader "${fullName}" not found in volunteers sheet or missing email.`);
+    return;
+  }
+
+  const firstName = firstName_(fullName) || (match.FirstName || '');
+  const dateMMDD = Utilities.formatDate(serviceDate, tz, 'MM/dd');
+
+  const subject = `This Sunday ${dateMMDD}: Morning Service Leader`;
+
+  // Placeholder you can replace later
+  const TEMPLATE_LINK_PLACEHOLDER = 'https://1drv.ms/w/c/54d988debea04632/IQCoWlgm8B7cSrKNhrnRL1yzAYlLtz_-wfYyGBtSf0QkvPU?e=hIIgQa';
+
+  let body = '';
+  body += `Hi ${firstName},\n\n`;
+  body += `This is a reminder that you are scheduled to lead the morning service on ${dateMMDD}. `;
+  body += `Here's a template for service leading (this document may be outdated, so please use the bulletin (attached) as the primary guide and the template for inspo).\n\n`;
+  body += `${TEMPLATE_LINK_PLACEHOLDER}\n\n`;
+
+  // Same rule: include notes only if morning doc is missing
+  if (!hasMorningDoc && NOTES_TEXT_BLOCK) {
+    body += NOTES_TEXT_BLOCK;
+  }
+
+  body += `Thanks for volunteering!\n\n`;
+  body += `Sincerely,\n\n`;
+  body += `${CONFIG.FROM_NAME}\n`;
+
+  // HTML version
+  let htmlBody = escapeHtml_(body).replace(/\n/g, '<br>');
+  if (!hasMorningDoc && NOTES_HTML_BLOCK) {
+    htmlBody += '<br><br>' + NOTES_HTML_BLOCK;
+  }
+
+  // Attachment: morning docx
+  const sendOpts = { name: CONFIG.FROM_NAME, htmlBody: htmlBody };
+  const morningDoc = (serviceDocxObj && serviceDocxObj.morning) ? serviceDocxObj.morning : null;
+  if (morningDoc) sendOpts.attachments = [morningDoc];
+
+  if (CONFIG.TEST_MODE) {
+    GmailApp.sendEmail(Session.getActiveUser().getEmail(), 'TEST: ' + subject, body, sendOpts);
+  } else {
+    GmailApp.sendEmail(match.Email, subject, body, sendOpts);
+  }
+}
+
+/**
+ * Find and download the morning/evening .docx from the Notion service page for a given date.
+ * Looser matching:
+ *   - morning = any file name ending in "-morning.docx"
+ *   - evening = any file name ending in "-evening.docx"
+ * Preference:
+ *   - If multiple matches exist, prefer the one that also contains the ISO date (YYYY-MM-DD).
+ *
+ * Returns: { morning: Blob|null, evening: Blob|null }
+ */
+function getServiceDocxAttachmentsForDate_(dateLike) {
+  if (!NOTION.ENABLED) return { morning: null, evening: null };
+
+  const iso = toIsoDate_(dateLike); // YYYY-MM-DD
+  const morningSuffix = '-morning.docx';
+  const eveningSuffix = '-evening.docx';
+
+  const rows = queryRowsByDate_(iso);
+  if (!rows || !rows.length) return { morning: null, evening: null };
+
+  let morningBlob = null;
+  let eveningBlob = null;
+
+  // Track best candidates (prefer names containing the iso date)
+  let morningBest = null; // {url,name,score}
+  let eveningBest = null;
+
+  for (const row of rows) {
+    const pageId = (row.id || '').replace(/-/g, '');
+    if (!pageId) continue;
+
+    const fileBlocks = findFileBlocksRecursive_(pageId);
+
+    for (const blk of fileBlocks) {
+      const info = getNotionFileBlockInfo_(blk); // {name,url} or null
+      if (!info || !info.url) continue;
+
+      const name = String(info.name || '').trim();
+      if (!name) continue;
+
+      const nameLower = name.toLowerCase();
+
+      // Score: +10 if contains iso date, +1 if suffix match (so suffix match required anyway)
+      const containsIso = nameLower.includes(iso.toLowerCase());
+      const score = (containsIso ? 10 : 0) + 1;
+
+      if (nameLower.endsWith(morningSuffix)) {
+        if (!morningBest || score > morningBest.score) {
+          morningBest = { url: info.url, name: name, score: score };
+        }
+      }
+
+      if (nameLower.endsWith(eveningSuffix)) {
+        if (!eveningBest || score > eveningBest.score) {
+          eveningBest = { url: info.url, name: name, score: score };
+        }
+      }
+    }
+
+    // If we found both best candidates on this page, no need to scan other date-matching pages
+    if (morningBest && eveningBest) break;
+  }
+
+  // Download best matches (if any)
+  if (morningBest) {
+    morningBlob = downloadToBlob_(morningBest.url, morningBest.name);
+  }
+  if (eveningBest) {
+    eveningBlob = downloadToBlob_(eveningBest.url, eveningBest.name);
+  }
+
+  return { morning: morningBlob, evening: eveningBlob };
+}
+
+/**
+ * Recursively finds all "file" blocks under a Notion block/page (handles pagination).
+ * Returns an array of block objects.
+ */
+function findFileBlocksRecursive_(rootBlockId) {
+  const out = [];
+  const queue = [rootBlockId];
+
+  while (queue.length) {
+    const blockId = queue.shift();
+    const children = fetchAllNotionChildren_(blockId);
+
+    for (const blk of children) {
+      if (blk && blk.type === 'file') out.push(blk);
+      // If it has children, recurse
+      if (blk && blk.has_children && blk.id) {
+        queue.push(String(blk.id).replace(/-/g, ''));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Fetch all children blocks for a given blockId with pagination.
+ */
+function fetchAllNotionChildren_(blockId) {
+  const results = [];
+  let cursor = null;
+
+  while (true) {
+    let url = `https://api.notion.com/v1/blocks/${blockId}/children?page_size=100`;
+    if (cursor) url += `&start_cursor=${encodeURIComponent(cursor)}`;
+
+    const resp = UrlFetchApp.fetch(url, { headers: notionHeaders_(), muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) break;
+
+    const json = JSON.parse(resp.getContentText());
+    const batch = json.results || [];
+    results.push(...batch);
+
+    if (!json.has_more || !json.next_cursor) break;
+    cursor = json.next_cursor;
+  }
+
+  return results;
+}
+
+/**
+ * Extract a filename + downloadable URL from a Notion "file" block.
+ * Attempts to use official fields, with a fallback to parsing from the URL.
+ */
+function getNotionFileBlockInfo_(fileBlock) {
+  if (!fileBlock || fileBlock.type !== 'file' || !fileBlock.file) return null;
+
+  const f = fileBlock.file;
+  let url = '';
+  if (f.type === 'file' && f.file && f.file.url) url = f.file.url;
+  if (f.type === 'external' && f.external && f.external.url) url = f.external.url;
+
+  // Notion usually returns a "name" for file blocks; if missing, infer from url path
+  let name = f.name || '';
+  if (!name && url) {
+    const m = url.split('?')[0].match(/\/([^\/?#]+)$/);
+    name = m ? decodeURIComponent(m[1]) : '';
+  }
+
+  return { name: name || '', url: url || '' };
+}
+
+/**
+ * Downloads a URL to a Gmail-compatible Blob, sets a filename.
+ */
+function downloadToBlob_(url, filename) {
+  try {
+    const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) return null;
+
+    const blob = resp.getBlob();
+    blob.setName(filename);
+
+    // (Optional) set the docx content type explicitly
+    // Gmail doesn't require this, but it's nice to be explicit.
+    blob.setContentType('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+
+    return blob;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Decide which attachment a person should get.
+ * Evening people get evening doc; everyone else gets morning doc.
+ */
+function getServiceTypeForPerson_(msg) {
+  return !!(msg && (msg.isEveningMusic || msg.isEveningPreach || msg.isEveningLead))
+    ? 'evening'
+    : 'morning';
+}
+
+function pickServiceDocxForPerson_(attachmentsObj, msg) {
+  if (!attachmentsObj) return null;
+  const serviceType = getServiceTypeForPerson_(msg);
+  return serviceType === 'evening' ? attachmentsObj.evening : attachmentsObj.morning;
+}
+
+// ---------- Sermon formatting (indent + remove lines) ----------
+function formatSermonForEmail_(raw) {
+  if (!raw) return { text: '', html: '' };
+
+  // Normalize newlines
+  const lines = String(raw).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+
+  // Remove meta JSON blob if it exists at the end (optional but recommended)
+  // (looks for a line starting with {"inputs": ...} and removes everything after it)
+  const jsonStart = lines.findIndex(l => /^\s*\{\s*"inputs"\s*:/.test(l));
+  const cleanedLines = (jsonStart >= 0) ? lines.slice(0, jsonStart) : lines.slice();
+
+  // Remove specific top-level lines anywhere
+  const filtered = cleanedLines.filter(l => {
+    const t = l.trim();
+    if (/^Sermon Text:\s*/i.test(t)) return false;
+    if (/^Sermon Title:\s*/i.test(t)) return false;
+    return true;
+  });
+
+  const indent1 = '        ';   // 8 SPACES
+  const indent2 = '                '; // 16 SPACES
+
+  const INDENT1_PREFIXES = [
+    'Call to Worship:',
+    'Prayer of Praise',
+    'Giving Passage:',
+    'Pastoral Prayer',
+    "Lord's Supper",
+    'Evening Passage:',
+    'Sermon' // exact "Sermon" line should be indented
+  ];
+
+  const isSectionHeader = (t) =>
+    t === '' ||
+    /^Sunday Service\s+—/i.test(t) ||
+    /^Morning Preacher:/i.test(t) ||
+    /^Morning Service$/i.test(t) ||
+    /^Evening Service$/i.test(t);
+
+  const startsWithAny = (t, arr) => arr.some(p => t.startsWith(p));
+
+  let prevTrim = '';
+  let inSermonBlock = false;
+
+  const out = [];
+
+  for (let i = 0; i < filtered.length; i++) {
+    const line = filtered[i];
+    const t = line.trim();
+
+    if (!t) { // keep blank lines
+      out.push('');
+      prevTrim = '';
+      continue;
+    }
+
+    // Toggle sermon block state: after indented "Sermon", indent next lines x2 until Lord's Supper
+    if (t === 'Sermon') inSermonBlock = true;
+    if (t.startsWith("Lord's Supper")) inSermonBlock = false;
+
+    // Bullet lines => indent x2
+    if (t.startsWith('•')) {
+      out.push(indent2 + t);
+      prevTrim = t;
+      continue;
+    }
+
+    // The text line right after Call to Worship / Giving Passage / Evening Passage => indent x1
+    const prevIsCall = prevTrim.startsWith('Call to Worship:');
+    const prevIsGiving = prevTrim.startsWith('Giving Passage:');
+    const prevIsEveningPassage = prevTrim.startsWith('Evening Passage:');
+    if (prevIsCall || prevIsGiving || prevIsEveningPassage) {
+      out.push(indent1 + t);
+      prevTrim = t;
+      continue;
+    }
+
+    // Inside sermon details (passage + Title lines) => indent x2
+    // (but don't indent if it's a section header)
+    if (inSermonBlock && !isSectionHeader(t) && t !== 'Sermon' && !t.startsWith("Lord's Supper")) {
+      out.push(indent2 + t);
+      prevTrim = t;
+      continue;
+    }
+
+    // Indent certain labels x1 (Call to Worship label itself, etc.)
+    if (startsWithAny(t, INDENT1_PREFIXES)) {
+      out.push(indent1 + t);
+      prevTrim = t;
+      continue;
+    }
+
+    // Default: keep as-is
+    out.push(t);
+    prevTrim = t;
+  }
+
+  const sermonText = out.join('\n').trim();
+
+  // HTML version: bold header + indent that survives wrapping
+  const headerHtml = `<b>Notes for this Sunday:</b>`;
+
+  // Make these bigger/smaller to control indent depth in HTML:
+  const INDENT1_PX = 28;  // [INDENT]
+  const INDENT2_PX = 56;  // [INDENT x2]
+
+  // Turn the already-indented plain text into per-line HTML with margins.
+  // (We look at leading spaces to decide which margin to apply.)
+  const htmlLines = sermonText.split('\n').map(line => {
+    const leadingSpaces = (line.match(/^ */) || [''])[0].length;
+    const trimmed = line.replace(/^ */, '');
+
+    let margin = 0;
+    if (leadingSpaces >= indent2.length) margin = INDENT2_PX;
+    else if (leadingSpaces >= indent1.length) margin = INDENT1_PX;
+
+    // Preserve blank lines
+    if (!trimmed) return `<div style="height:0.6em;"></div>`;
+
+    return `<div style="margin-left:${margin}px;">${escapeHtml_(trimmed)}</div>`;
+  }).join('');
+
+  const sermonHtml = `${headerHtml}<div style="margin-top:6px;">${htmlLines}</div>`;
+
+  return { text: sermonText, html: sermonHtml };
+}
+
+// Basic HTML escaping for <pre> content
+function escapeHtml_(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function getVolunteerServiceProfile_(msg) {
+  const servesMorning =
+    !!(
+      msg.isCounter ||
+      msg.isAV ||
+      msg.isMorningMusician ||
+      msg.isMorningLead ||
+      msg.isGuestPreach ||
+      msg.isCounterBackup ||
+      msg.isAVBackup
+    );
+
+  const servesEvening =
+    !!(
+      msg.isEveningLead ||
+      msg.isEveningMusic ||
+      msg.isEveningPreach
+    );
+
+  return {
+    morning: servesMorning,
+    evening: servesEvening
+  };
+}
+
+function getAttachmentsForVolunteer_(attachmentsObj, serviceProfile) {
+  if (!attachmentsObj) return [];
+
+  const out = [];
+  if (serviceProfile.morning && attachmentsObj.morning) out.push(attachmentsObj.morning);
+  if (serviceProfile.evening && attachmentsObj.evening) out.push(attachmentsObj.evening);
+  return out;
+}
+
+function buildNotesTextForVolunteer_(serviceProfile, notesByService) {
+  const pieces = [];
+
+  if (serviceProfile.morning && notesByService.morning.text) {
+    pieces.push(notesByService.morning.text.trim());
+  }
+
+  if (serviceProfile.evening && notesByService.evening.text) {
+    const eveningText = notesByService.evening.text.trim();
+    const alreadyAddedMorning =
+      serviceProfile.morning &&
+      notesByService.morning.text &&
+      notesByService.morning.text.trim() === eveningText;
+
+    if (!alreadyAddedMorning) {
+      pieces.push(eveningText);
+    }
+  }
+
+  if (!pieces.length) return '';
+  return '\n' + pieces.join('\n\n') + '\n';
+}
+
+function buildNotesHtmlForVolunteer_(serviceProfile, notesByService) {
+  const pieces = [];
+
+  if (serviceProfile.morning && notesByService.morning.html) {
+    pieces.push(notesByService.morning.html);
+  }
+
+  if (serviceProfile.evening && notesByService.evening.html) {
+    const eveningHtml = notesByService.evening.html;
+    const alreadyAddedMorning =
+      serviceProfile.morning &&
+      notesByService.morning.html &&
+      notesByService.morning.html === eveningHtml;
+
+    if (!alreadyAddedMorning) {
+      pieces.push(eveningHtml);
+    }
+  }
+
+  return pieces.join('<br><br>');
+}
+
+function buildHtmlBodyWithoutDuplicateNotes_(plainBody, notesHtml) {
+  let htmlBody = escapeHtml_(plainBody).replace(/\n/g, '<br>');
+
+  // remove the plain-text "Notes for this Sunday:" block from the HTML rendering
+  // so we don't show both the escaped plain notes and the formatted HTML notes
+  const marker = 'Notes for this Sunday:<br>';
+  const idx = htmlBody.indexOf(marker);
+
+  if (idx >= 0) {
+    htmlBody = htmlBody.substring(0, idx);
+  }
+
+  if (notesHtml) {
+    htmlBody += '<br><br>' + notesHtml;
+  }
+
+  return htmlBody;
+}
